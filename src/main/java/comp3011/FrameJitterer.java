@@ -4,10 +4,14 @@
  * 
  * Authors:
  *   1. Simon Ratcliffe, in collaboration with GPT-5.6 Terra
- *   2. <student name and student number insert here upon modification>
+ *   2. COMP3011 Student (Assignment 2 Multi-Threaded Video Player)
  *
- * Copyright 2026 Simon Ratcliffe
- */
+* Attribution / Acknowledgments
+*   - Changed to use ThreadLocal storage instead of instance pixel buffer
+*     so the use of data races is no longer a problem while processing frames concurrently using the CLO1 pipeline.
+*
+* Copyright 2026 by Simon Ratcliffe
+*/
 package comp3011;
 
 import java.nio.ByteBuffer;
@@ -16,14 +20,15 @@ import java.util.Random;
 import org.bytedeco.javacv.Frame;
 
 /**
- * Randomly offsets each image frame to simulate unstable film transport. The sprockets driving film through old
- * projectors always had a tiny bit of slack or take-up in them, causing frames to jitter up and down or left and right
- * slightly as they went through the projection bed. Simple but effective little effect.
+ * Randomly shifts each of the image frames such that it mimics an unstable passage of film. The projectors used in
+ * the older days for projecting the film had the sprockets which always had a little bit of space in them, which was
+ * responsible for the jitter in the frames as the film would get projected. Hence, this effect, even though small
+ * and simple, is quite effective.
  *
  * <p>
- * A deterministic per-frame random sequence chooses horizontal and vertical
- * offsets. {@link #jitterFrame(ByteBuffer, int, int)} copies the original pixels
- * into the shifted position and fills exposed areas with black.
+ * A random frame sequence, which is deterministic, selects both vertical and horizontal offsets. The method
+ * {@link #jitterFrame(ByteBuffer, int, int)} simply shifts the original pixels to the new location and replaces
+ * the exposed parts with black.
  * </p>
  */
 public class FrameJitterer extends FrameProcessor {
@@ -33,7 +38,7 @@ public class FrameJitterer extends FrameProcessor {
 
     private final int instanceIndex;
     private int mediaSeed;
-    private byte[] sourcePixels;
+    private final ThreadLocal<byte[]> threadLocalSourcePixels = new ThreadLocal<>();
     private byte[] blackRow;
 
     public FrameJitterer() {
@@ -46,9 +51,7 @@ public class FrameJitterer extends FrameProcessor {
         super.initialise(videoInfo);
         mediaSeed = saltedMediaSeed(videoInfo.mediaName(), instanceIndex + SEED_SALT);
 
-        int frameBytes = videoInfo.imageStride() * videoInfo.imageHeight();
         int widthBytes = videoInfo.imageWidth() * videoInfo.imageChannels();
-        sourcePixels = new byte[frameBytes];
         blackRow = new byte[widthBytes];
     }
 
@@ -129,6 +132,12 @@ public class FrameJitterer extends FrameProcessor {
         int stride = videoInfo.imageStride();
         int frameBytes = stride * height;
         int widthBytes = width * channels;
+
+        byte[] sourcePixels = threadLocalSourcePixels.get();
+        if (sourcePixels == null || sourcePixels.length < frameBytes) {
+            sourcePixels = new byte[frameBytes];
+            threadLocalSourcePixels.set(sourcePixels);
+        }
 
         ByteBuffer source = pixels.duplicate();
         source.clear();

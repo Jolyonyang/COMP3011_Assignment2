@@ -13,7 +13,7 @@
   <modelVersion>4.0.0</modelVersion>
 
   <groupId>comp3011</groupId>
-  <artifactId>VideoPlayerSingleThread</artifactId>
+  <artifactId>VideoPlayerMultiThreaded</artifactId>
   <version>0.1</version>
 
   <properties>
@@ -33,6 +33,12 @@
       <groupId>org.bytedeco</groupId>
       <artifactId>javacv-platform</artifactId>
       <version>${javacv.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <version>5.11.4</version>
+      <scope>test</scope>
     </dependency>
   </dependencies>
 
