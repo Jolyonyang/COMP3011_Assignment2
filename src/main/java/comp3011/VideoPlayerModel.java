@@ -63,9 +63,11 @@ public class VideoPlayerModel {
     private static final long FIVE_SECONDS_US = 5_000_000L;
     private static final long AUDIO_LEAD_NS = 30_000_000L;
 
-    // Concurrency parameters tuned for 8-core benchmark platforms (e.g. TITAN VM)
-    private static final int WORKER_COUNT = Math.max(4, Runtime.getRuntime().availableProcessors());
-    private static final int MAX_IN_FLIGHT_FRAMES = WORKER_COUNT * 2;
+    // Concurrency parameters tuned for 8-core benchmark platforms (e.g. TITAN VM c7i.2xlarge)
+    // Reserve at least 1 core for JavaFX UI thread, Prism Direct3D render thread, and TITAN screen capture
+    private static final int WORKER_COUNT = Math.max(3, Runtime.getRuntime().availableProcessors() - 1);
+    private static final int MAX_BUFFERED_FRAMES = 36;
+    private static final int PREROLL_FRAME_COUNT = 10;
 
     private final List<FrameProcessor> frameProcessors;
     private final Queue<PendingAudio> pendingAudio = new ConcurrentLinkedQueue<>();
@@ -82,10 +84,10 @@ public class VideoPlayerModel {
     private ExecutorService workerPool;
     private Thread decoderThread;
     private final PriorityBlockingQueue<PreparedFrame> readyFrames = new PriorityBlockingQueue<>();
-    private final Semaphore inFlightSemaphore = new Semaphore(MAX_IN_FLIGHT_FRAMES);
-    private final BlockingQueue<Frame> framePool = new ArrayBlockingQueue<>(MAX_IN_FLIGHT_FRAMES + 2);
+    private final BlockingQueue<Frame> framePool = new ArrayBlockingQueue<>(MAX_BUFFERED_FRAMES + 4);
     private final AtomicLong currentSeekEpoch = new AtomicLong(0);
     private final AtomicBoolean playbackActive = new AtomicBoolean(false);
+    private final AtomicBoolean decoderEof = new AtomicBoolean(false);
 
     private final AnimationTimer playbackTimer = new AnimationTimer() {
         @Override
@@ -304,6 +306,7 @@ public class VideoPlayerModel {
         workerPool = Executors.newFixedThreadPool(WORKER_COUNT, (Runnable r) -> {
             Thread t = new Thread(r, "VideoWorker-" + threadIndex.getAndIncrement());
             t.setDaemon(true);
+            t.setPriority(Thread.NORM_PRIORITY - 1);
             return t;
         });
 
@@ -314,7 +317,8 @@ public class VideoPlayerModel {
         int stride = width * channels;
         int bufferBytes = stride * height;
 
-        for (int i = 0; i < MAX_IN_FLIGHT_FRAMES; i++) {
+        int poolSize = Math.max(16, WORKER_COUNT * 3);
+        for (int i = 0; i < poolSize; i++) {
             Frame pooled = new Frame(width, height, Frame.DEPTH_UBYTE, channels);
             pooled.imageStride = stride;
             ByteBuffer directBuffer = ByteBuffer.allocateDirect(bufferBytes);
@@ -322,9 +326,8 @@ public class VideoPlayerModel {
             framePool.offer(pooled);
         }
 
-        inFlightSemaphore.drainPermits();
-        inFlightSemaphore.release(MAX_IN_FLIGHT_FRAMES);
         readyFrames.clear();
+        decoderEof.set(false);
     }
 
     private void startDecoderThread() {
@@ -350,12 +353,22 @@ public class VideoPlayerModel {
                 startingEpoch = currentEpoch;
             }
 
+            // Flow control: keep readyFrames comfortably filled up to MAX_BUFFERED_FRAMES.
+            if (readyFrames.size() >= MAX_BUFFERED_FRAMES) {
+                try {
+                    Thread.sleep(5);
+                } catch (InterruptedException e) {
+                    if (!playbackOpen || !playbackActive.get()) break;
+                }
+                continue;
+            }
+
             Frame frame;
             long timestampUs;
             try {
                 frame = grabber.grab();
                 if (frame == null) {
-                    Platform.runLater(this::finishPlayback);
+                    decoderEof.set(true);
                     break;
                 }
                 timestampUs = grabber.getTimestamp();
@@ -395,15 +408,7 @@ public class VideoPlayerModel {
                 }
             }
 
-            try {
-                inFlightSemaphore.acquire();
-            } catch (InterruptedException e) {
-                if (!playbackOpen || !playbackActive.get()) break;
-                continue;
-            }
-
             if (currentSeekEpoch.get() != currentEpoch) {
-                inFlightSemaphore.release();
                 continue;
             }
 
@@ -426,7 +431,6 @@ public class VideoPlayerModel {
         try {
             if (currentSeekEpoch.get() != taskEpoch || !playbackOpen) {
                 recycleFrame(frame);
-                inFlightSemaphore.release();
                 return;
             }
 
@@ -438,38 +442,17 @@ public class VideoPlayerModel {
 
             recycleFrame(frame);
 
-            if (firstTimestampUs == NO_SEEK_REQUEST) {
-                synchronized (this) {
-                    if (firstTimestampUs == NO_SEEK_REQUEST) {
-                        firstTimestampUs = timestampUs;
-                        playbackStartNs = System.nanoTime();
-                        if (pauseRequested) {
-                            pauseStartedNs = playbackStartNs;
-                        }
-                    }
-                }
-            }
-
-            long relativeTimestampUs = Math.max(0, timestampUs - firstTimestampUs);
-            long logicalTimestampUs = logicalPlaybackBaseUs + relativeTimestampUs;
-            long targetTimeNs = playbackStartNs + relativeTimestampUs * 1_000L;
-
             PreparedFrame prepared = new PreparedFrame(
                     image,
                     frameNumber,
                     timestampUs,
-                    logicalTimestampUs,
-                    targetTimeNs,
                     System.nanoTime());
 
             if (currentSeekEpoch.get() == taskEpoch && playbackOpen) {
                 readyFrames.offer(prepared);
-            } else {
-                inFlightSemaphore.release();
             }
         } catch (Exception e) {
             recycleFrame(frame);
-            inFlightSemaphore.release();
             if (playbackOpen) {
                 Platform.runLater(() -> handlePlaybackError(e));
             }
@@ -525,20 +508,58 @@ public class VideoPlayerModel {
 
         writeDueAudio(now);
 
+        if (pauseRequested) {
+            if (playbackStartNs == 0 && !readyFrames.isEmpty()) {
+                PreparedFrame frame = readyFrames.poll();
+                firstTimestampUs = frame.timestampUs();
+                playbackStartNs = now;
+                pauseStartedNs = now;
+                displayPreparedFrame(frame, now, now);
+            }
+            return;
+        }
+
+        if (playbackStartNs == 0) {
+            int targetPreroll = Math.min(PREROLL_FRAME_COUNT, totalVideoFrames > 0 ? totalVideoFrames : PREROLL_FRAME_COUNT);
+            if (readyFrames.size() < targetPreroll && !decoderEof.get()) {
+                return;
+            }
+
+            PreparedFrame first = readyFrames.peek();
+            if (first == null) {
+                if (decoderEof.get()) {
+                    finishPlayback();
+                }
+                return;
+            }
+            firstTimestampUs = first.timestampUs();
+            playbackStartNs = now;
+        }
+
+        if (readyFrames.isEmpty() && decoderEof.get()) {
+            finishPlayback();
+            return;
+        }
+
         PreparedFrame frame = readyFrames.peek();
-        if (frame != null && frame.targetTimeNs() <= now) {
-            readyFrames.poll();
-            inFlightSemaphore.release();
-            displayPreparedFrame(frame, now);
+        if (frame != null) {
+            long relativeTimestampUs = Math.max(0, frame.timestampUs() - firstTimestampUs);
+            long targetTimeNs = playbackStartNs + relativeTimestampUs * 1_000L;
+
+            if (targetTimeNs <= now) {
+                readyFrames.poll();
+                displayPreparedFrame(frame, targetTimeNs, now);
+            }
         }
     }
 
-    private void displayPreparedFrame(PreparedFrame frame, long now) {
-        currentTimestampUs = frame.logicalTimestampUs();
+    private void displayPreparedFrame(PreparedFrame frame, long targetTimeNs, long now) {
+        long relativeTimestampUs = Math.max(0, frame.timestampUs() - firstTimestampUs);
+        currentTimestampUs = logicalPlaybackBaseUs + relativeTimestampUs;
         relativeSeekBaseUs = NO_SEEK_REQUEST;
 
         if (intFrameRate > 0 && frame.frameNumber() % intFrameRate == 0) {
-            long remainingUs = (frame.targetTimeNs() - frame.preparedAtNs()) / 1_000L;
+            long remainingUs = (targetTimeNs - frame.preparedAtNs()) / 1_000L;
             if (remainingUs < 0) {
                 System.out.printf("Frame headroom is \u001B[31m%5dus\u001B[0m out of %dus spare.%n",
                         remainingUs,
@@ -602,8 +623,7 @@ public class VideoPlayerModel {
     private void flushPipelineQueues() {
         readyFrames.clear();
         pendingAudio.clear();
-        inFlightSemaphore.drainPermits();
-        inFlightSemaphore.release(MAX_IN_FLIGHT_FRAMES);
+        decoderEof.set(false);
     }
 
     private void resetPlaybackClock(long logicalTimestampUs) {
@@ -761,8 +781,6 @@ public class VideoPlayerModel {
             Image image,
             int frameNumber,
             long timestampUs,
-            long logicalTimestampUs,
-            long targetTimeNs,
             long preparedAtNs) implements Comparable<PreparedFrame> {
 
         @Override
