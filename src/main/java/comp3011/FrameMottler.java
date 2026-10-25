@@ -7,8 +7,11 @@
  *   2. JiaoYang Yang (a3126438)
  *
  * Attribution / Acknowledgments:
+ *   - Algorithm, constants and noise generation are kept identical to the starter
+ *     so output matches the reference player pixel-for-pixel.
  *   - Refactored instance damage mask cache and block scale indices into ThreadLocal and
- *     local parameters to eliminate data races and critical section contention (CLO1).
+ *     local parameters to eliminate data races between worker threads (CLO1).
+ *   - Added a byte[] fast path for heap-backed frames (identical results).
  *
  * Copyright 2026 Simon Ratcliffe
  */
@@ -20,22 +23,35 @@ import java.util.Random;
 import org.bytedeco.javacv.Frame;
 
 /**
- * Simulates patchy, uneven emulsion deterioration across each frame.
+ * Adds uneven brightness and colour staining to simulate aged film emulsion.
+ * Having played around with the tuning of this as much as I'd like, but the
+ * effect still looks okay.
  *
  * <p>
- * Combines three multi-scale noise fields to perturb brightness and color
- * balance. High-pass damage masks modulate the effect so that deterioration
- * appears in blotchy clusters rather than uniform noise.
+ * Initialisation builds multi-scale noise fields and colour lookup tables.
+ * {@link #process(Frame, InfoFrame)} samples those fields in image blocks and
+ * applies the selected channel scales through
+ * {@link #applyMottleBlock(ByteBuffer, int, int, int, int, int, int, int, int, int)}.
+ * </p>
+ *
+ * <p>
+ * Thread safety: all state written after {@link #initialise(InfoVideo)} is
+ * either per-call (noise fields, block scale indices) or per-thread (damage
+ * mask cache), so {@link #process(Frame, InfoFrame)} may run concurrently on
+ * different frames.
  * </p>
  */
 public class FrameMottler extends FrameProcessor {
-    private static final int NOISE_GRID_WIDTH = 120;
-    private static final int NOISE_GRID_HEIGHT = 68;
+    private static final int NOISE_GRID_WIDTH = 64;
+    private static final int NOISE_GRID_HEIGHT = 36;
     private static final int FINE_SMOOTHING_PASSES = 1;
-    private static final int MEDIUM_SMOOTHING_PASSES = 3;
-    private static final int LARGE_SMOOTHING_PASSES = 6;
-    private static final int DAMAGE_MASK_SMOOTHING_PASSES = 4;
-    private static final int DAMAGE_MASK_BLEND_FRAMES = 12;
+    private static final int MEDIUM_SMOOTHING_PASSES = 4;
+    private static final int LARGE_SMOOTHING_PASSES = 11;
+    private static final double FINE_MOTTLE_WEIGHT = 0.25;
+    private static final double MEDIUM_MOTTLE_WEIGHT = 0.45;
+    private static final double LARGE_MOTTLE_WEIGHT = 0.30;
+    private static final int DAMAGE_MASK_BLEND_FRAMES = 72;
+    private static final int DAMAGE_MASK_SMOOTHING_PASSES = 13;
     private static final double DAMAGE_MASK_THRESHOLD = 0.55;
     private static final int EFFECT_BLOCK_SIZE = 4;
     private static final int SCALE_LOOKUP_SIZE = 512;
@@ -55,13 +71,14 @@ public class FrameMottler extends FrameProcessor {
 
     private static int nextInstanceIndex;
 
+    // Per-thread copy of the starter's damage mask cache (segment + the two masks).
     private static final class DamageMaskCache {
         int segment = Integer.MIN_VALUE;
         double[] damageMaskA;
         double[] damageMaskB;
     }
 
-    private final ThreadLocal<DamageMaskCache> threadLocalDamageMaskCache = ThreadLocal.withInitial(DamageMaskCache::new);
+    private final ThreadLocal<DamageMaskCache> damageMaskCache = ThreadLocal.withInitial(DamageMaskCache::new);
 
     private final int instanceIndex;
     private int mediaSeed;
@@ -108,8 +125,7 @@ public class FrameMottler extends FrameProcessor {
         double[] stainField = buildMultiScaleNoiseField(info.frameNumber(), STAIN_FIELD_SALT);
         int damageMaskSegment = info.frameNumber() / DAMAGE_MASK_BLEND_FRAMES;
         double damageMaskBlend = (info.frameNumber() % DAMAGE_MASK_BLEND_FRAMES) / (double) DAMAGE_MASK_BLEND_FRAMES;
-
-        DamageMaskCache cache = threadLocalDamageMaskCache.get();
+        DamageMaskCache cache = damageMaskCache.get();
         ensureDamageMaskFields(cache, damageMaskSegment);
 
         mottleFrame(pixels, brightnessField, stainField, cache, damageMaskBlend);
@@ -134,10 +150,9 @@ public class FrameMottler extends FrameProcessor {
             return;
         }
 
+        double scale = (gridSize - 1) / (double) (imageSize - 1);
         for (int position = 0; position < imageSize; position++) {
-            double gridPosition = (position + 0.5) / imageSize * (gridSize - 1);
-            gridPosition = clamp(gridPosition, 0.0, gridSize - 1.0);
-
+            double gridPosition = position * scale;
             int gridStart = (int) Math.floor(gridPosition);
             if (gridStart >= gridSize - 1) {
                 gridStart = gridSize - 2;
@@ -150,20 +165,33 @@ public class FrameMottler extends FrameProcessor {
     }
 
     private void buildScaleLookups() {
-        minimumScale = 1.0 - MAX_DARKEN_PERCENTAGE / 100.0 * (1.0 + BLUE_STAIN_LOSS_PERCENTAGE / 100.0);
-        maximumScale = 1.0 + MAX_LIGHTEN_PERCENTAGE / 100.0 * (1.0 + RED_STAIN_BOOST_PERCENTAGE / 100.0);
-        scaleLookups = new byte[SCALE_LOOKUP_SIZE][256];
+        double darkestBrightnessScale = 1.0 - MAX_DARKEN_PERCENTAGE / 100.0;
+        double brightestScale = 1.0 + MAX_LIGHTEN_PERCENTAGE / 100.0;
+        double bluestScale = 1.0 - BLUE_STAIN_LOSS_PERCENTAGE / 100.0;
+        double reddestScale = 1.0 + RED_STAIN_BOOST_PERCENTAGE / 100.0;
+        double greenestScale = 1.0 + GREEN_STAIN_BOOST_PERCENTAGE / 100.0;
 
-        for (int i = 0; i < SCALE_LOOKUP_SIZE; i++) {
-            double scale = minimumScale + (maximumScale - minimumScale) * i / (SCALE_LOOKUP_SIZE - 1);
-            for (int value = 0; value < 256; value++) {
-                scaleLookups[i][value] = (byte) clamp((int) Math.round(value * scale), 0, 255);
+        minimumScale = Math.min(darkestBrightnessScale, darkestBrightnessScale * bluestScale);
+        maximumScale = Math.max(brightestScale, brightestScale * Math.max(reddestScale, greenestScale));
+
+        double padding = (maximumScale - minimumScale) * 0.05;
+        minimumScale -= padding;
+        maximumScale += padding;
+
+        scaleLookups = new byte[SCALE_LOOKUP_SIZE][256];
+        for (int scaleIndex = 0; scaleIndex < SCALE_LOOKUP_SIZE; scaleIndex++) {
+            double blend = scaleIndex / (double) (SCALE_LOOKUP_SIZE - 1);
+            double scale = lerp(minimumScale, maximumScale, blend);
+            byte[] lookup = scaleLookups[scaleIndex];
+
+            for (int value = 0; value < lookup.length; value++) {
+                lookup[value] = (byte) clamp((int) Math.round(value * scale), 0, 255);
             }
         }
     }
 
     private void ensureDamageMaskFields(DamageMaskCache cache, int segment) {
-        if (segment == cache.segment && cache.damageMaskA != null && cache.damageMaskB != null) {
+        if (segment == cache.segment) {
             return;
         }
 
@@ -176,37 +204,42 @@ public class FrameMottler extends FrameProcessor {
         double[] fineField = buildNoiseField(frameNumber, fieldSalt ^ FINE_FIELD_SALT, FINE_SMOOTHING_PASSES);
         double[] mediumField = buildNoiseField(frameNumber, fieldSalt ^ MEDIUM_FIELD_SALT, MEDIUM_SMOOTHING_PASSES);
         double[] largeField = buildNoiseField(frameNumber, fieldSalt ^ LARGE_FIELD_SALT, LARGE_SMOOTHING_PASSES);
+        double[] field = new double[fineField.length];
 
-        double[] blended = new double[fineField.length];
-        for (int i = 0; i < blended.length; i++) {
-            blended[i] = fineField[i] * 0.20 + mediumField[i] * 0.35 + largeField[i] * 0.45;
+        for (int i = 0; i < field.length; i++) {
+            field[i] = fineField[i] * FINE_MOTTLE_WEIGHT
+                    + mediumField[i] * MEDIUM_MOTTLE_WEIGHT
+                    + largeField[i] * LARGE_MOTTLE_WEIGHT;
         }
-        return blended;
+
+        normaliseField(field);
+        return field;
     }
 
     private double[] buildNoiseField(int frameNumber, int fieldSalt, int smoothingPasses) {
         double[] field = new double[NOISE_GRID_WIDTH * NOISE_GRID_HEIGHT];
+        double[] scratch = new double[field.length];
         Random random = new Random(seedForField(frameNumber, fieldSalt));
 
         for (int i = 0; i < field.length; i++) {
             field[i] = random.nextDouble();
         }
 
-        double[] scratch = new double[field.length];
         for (int pass = 0; pass < smoothingPasses; pass++) {
             smoothField(field, scratch);
-            double[] temp = field;
+            double[] swap = field;
             field = scratch;
-            scratch = temp;
+            scratch = swap;
         }
 
+        normaliseField(field);
         return field;
     }
 
     private long seedForField(int frameNumber, int fieldSalt) {
-        long seed = Integer.toUnsignedLong(mediaSeed)
-                ^ (Integer.toUnsignedLong(frameNumber) * 0x9e3779b97f4a7c15L)
-                ^ Integer.toUnsignedLong(fieldSalt);
+        long seed = Integer.toUnsignedLong(mediaSeed);
+        seed ^= (long) frameNumber * 0x9e3779b97f4a7c15L;
+        seed ^= Integer.toUnsignedLong(fieldSalt);
 
         seed ^= seed >>> 30;
         seed *= 0xbf58476d1ce4e5b9L;
@@ -218,29 +251,40 @@ public class FrameMottler extends FrameProcessor {
 
     private void smoothField(double[] source, double[] destination) {
         for (int y = 0; y < NOISE_GRID_HEIGHT; y++) {
-            int yAbove = Math.max(0, y - 1);
-            int yBelow = Math.min(NOISE_GRID_HEIGHT - 1, y + 1);
-
-            int rowStart = y * NOISE_GRID_WIDTH;
-            int aboveStart = yAbove * NOISE_GRID_WIDTH;
-            int belowStart = yBelow * NOISE_GRID_WIDTH;
-
             for (int x = 0; x < NOISE_GRID_WIDTH; x++) {
-                int xLeft = Math.max(0, x - 1);
-                int xRight = Math.min(NOISE_GRID_WIDTH - 1, x + 1);
+                double total = 0.0;
+                int samples = 0;
 
-                double total = source[aboveStart + xLeft]
-                        + source[aboveStart + x] * 2.0
-                        + source[aboveStart + xRight]
-                        + source[rowStart + xLeft] * 2.0
-                        + source[rowStart + x] * 4.0
-                        + source[rowStart + xRight] * 2.0
-                        + source[belowStart + xLeft]
-                        + source[belowStart + x] * 2.0
-                        + source[belowStart + xRight];
+                for (int dy = -1; dy <= 1; dy++) {
+                    int sampleY = clamp(y + dy, 0, NOISE_GRID_HEIGHT - 1);
+                    for (int dx = -1; dx <= 1; dx++) {
+                        int sampleX = clamp(x + dx, 0, NOISE_GRID_WIDTH - 1);
+                        total += source[sampleY * NOISE_GRID_WIDTH + sampleX];
+                        samples++;
+                    }
+                }
 
-                destination[rowStart + x] = total / 16.0;
+                destination[y * NOISE_GRID_WIDTH + x] = total / samples;
             }
+        }
+    }
+
+    private void normaliseField(double[] field) {
+        double min = Double.POSITIVE_INFINITY;
+        double max = Double.NEGATIVE_INFINITY;
+
+        for (double value : field) {
+            min = Math.min(min, value);
+            max = Math.max(max, value);
+        }
+
+        double range = max - min;
+        if (range <= 0.0) {
+            return;
+        }
+
+        for (int i = 0; i < field.length; i++) {
+            field[i] = (field[i] - min) / range;
         }
     }
 
@@ -255,6 +299,7 @@ public class FrameMottler extends FrameProcessor {
         int channels = videoInfo.imageChannels();
         int stride = videoInfo.imageStride();
 
+        // Local replacement for the starter's blockXxxScaleIndex instance fields.
         int[] scaleIndices = new int[3];
         byte[] data = backingArray(pixels);
 
@@ -289,20 +334,19 @@ public class FrameMottler extends FrameProcessor {
                             scaleIndices[0],
                             scaleIndices[1],
                             scaleIndices[2]);
-                    continue;
+                } else {
+                    applyMottleBlock(
+                            pixels,
+                            blockX,
+                            blockXEnd,
+                            blockY,
+                            blockYEnd,
+                            channels,
+                            stride,
+                            scaleIndices[0],
+                            scaleIndices[1],
+                            scaleIndices[2]);
                 }
-
-                applyMottleBlock(
-                        pixels,
-                        blockX,
-                        blockXEnd,
-                        blockY,
-                        blockYEnd,
-                        channels,
-                        stride,
-                        scaleIndices[0],
-                        scaleIndices[1],
-                        scaleIndices[2]);
             }
         }
     }
@@ -314,8 +358,8 @@ public class FrameMottler extends FrameProcessor {
             double[] stainField,
             DamageMaskCache cache,
             double damageMaskBlend,
-            int[] outIndices) {
-        double damageStrength = sampleDamageMask(x, y, cache, damageMaskBlend);
+            int[] scaleIndices) {
+        double damageStrength = sampleDamageMask(cache, x, y, damageMaskBlend);
         if (damageStrength <= 0.0) {
             return false;
         }
@@ -323,11 +367,11 @@ public class FrameMottler extends FrameProcessor {
         double brightness = smoothstep(sampleField(brightnessField, x, y));
         double stain = smoothstep(sampleField(stainField, x, y));
 
-        setBlockScaleIndices(brightness, stain, damageStrength, outIndices);
+        setBlockScaleIndices(brightness, stain, damageStrength, scaleIndices);
         return true;
     }
 
-    private double sampleDamageMask(int x, int y, DamageMaskCache cache, double damageMaskBlend) {
+    private double sampleDamageMask(DamageMaskCache cache, int x, int y, double damageMaskBlend) {
         double maskA = sampleField(cache.damageMaskA, x, y);
         double maskB = sampleField(cache.damageMaskB, x, y);
         double mask = smoothstep(lerp(maskA, maskB, damageMaskBlend));
@@ -348,7 +392,7 @@ public class FrameMottler extends FrameProcessor {
         return lerp(top, bottom, yBlend);
     }
 
-    private void setBlockScaleIndices(double brightness, double stain, double damageStrength, int[] outIndices) {
+    private void setBlockScaleIndices(double brightness, double stain, double damageStrength, int[] scaleIndices) {
         double brightnessScale;
         if (brightness < 0.5) {
             brightnessScale = 1.0 - (0.5 - brightness) * 2.0 * MAX_DARKEN_PERCENTAGE / 100.0;
@@ -364,35 +408,9 @@ public class FrameMottler extends FrameProcessor {
         double greenScale = brightnessScale * (1.0 + stainStrength * GREEN_STAIN_BOOST_PERCENTAGE / 100.0);
         double redScale = brightnessScale * (1.0 + stainStrength * RED_STAIN_BOOST_PERCENTAGE / 100.0);
 
-        outIndices[0] = scaleIndex(blueScale);
-        outIndices[1] = scaleIndex(greenScale);
-        outIndices[2] = scaleIndex(redScale);
-    }
-
-    private void applyMottleBlock(
-            byte[] data,
-            int blockX,
-            int blockXEnd,
-            int blockY,
-            int blockYEnd,
-            int channels,
-            int stride,
-            int blueIndex,
-            int greenIndex,
-            int redIndex) {
-        byte[] blueLookup = scaleLookups[blueIndex];
-        byte[] greenLookup = scaleLookups[greenIndex];
-        byte[] redLookup = scaleLookups[redIndex];
-
-        for (int y = blockY; y < blockYEnd; y++) {
-            int rowStart = y * stride;
-            for (int x = blockX; x < blockXEnd; x++) {
-                int base = rowStart + x * channels;
-                data[base] = blueLookup[data[base] & 0xff];
-                data[base + 1] = greenLookup[data[base + 1] & 0xff];
-                data[base + 2] = redLookup[data[base + 2] & 0xff];
-            }
-        }
+        scaleIndices[0] = scaleIndex(blueScale);
+        scaleIndices[1] = scaleIndex(greenScale);
+        scaleIndices[2] = scaleIndex(redScale);
     }
 
     private void applyMottleBlock(
@@ -403,12 +421,12 @@ public class FrameMottler extends FrameProcessor {
             int blockYEnd,
             int channels,
             int stride,
-            int blueIndex,
-            int greenIndex,
-            int redIndex) {
-        byte[] blueLookup = scaleLookups[blueIndex];
-        byte[] greenLookup = scaleLookups[greenIndex];
-        byte[] redLookup = scaleLookups[redIndex];
+            int blueScaleIndex,
+            int greenScaleIndex,
+            int redScaleIndex) {
+        byte[] blueLookup = scaleLookups[blueScaleIndex];
+        byte[] greenLookup = scaleLookups[greenScaleIndex];
+        byte[] redLookup = scaleLookups[redScaleIndex];
 
         for (int y = blockY; y < blockYEnd; y++) {
             int rowStart = y * stride;
@@ -423,6 +441,32 @@ public class FrameMottler extends FrameProcessor {
         }
     }
 
+    // byte[] twin of the ByteBuffer version above; same lookups, same result.
+    private void applyMottleBlock(
+            byte[] data,
+            int blockX,
+            int blockXEnd,
+            int blockY,
+            int blockYEnd,
+            int channels,
+            int stride,
+            int blueScaleIndex,
+            int greenScaleIndex,
+            int redScaleIndex) {
+        byte[] blueLookup = scaleLookups[blueScaleIndex];
+        byte[] greenLookup = scaleLookups[greenScaleIndex];
+        byte[] redLookup = scaleLookups[redScaleIndex];
+
+        for (int y = blockY; y < blockYEnd; y++) {
+            int base = y * stride + blockX * channels;
+            for (int x = blockX; x < blockXEnd; x++, base += channels) {
+                data[base] = blueLookup[data[base] & 0xff];
+                data[base + 1] = greenLookup[data[base + 1] & 0xff];
+                data[base + 2] = redLookup[data[base + 2] & 0xff];
+            }
+        }
+    }
+
     private int scaleIndex(double scale) {
         double blend = (scale - minimumScale) / (maximumScale - minimumScale);
         return clamp((int) Math.round(blend * (SCALE_LOOKUP_SIZE - 1)), 0, SCALE_LOOKUP_SIZE - 1);
@@ -433,12 +477,7 @@ public class FrameMottler extends FrameProcessor {
     }
 
     private double smoothstep(double value) {
-        if (value <= 0.0) {
-            return 0.0;
-        }
-        if (value >= 1.0) {
-            return 1.0;
-        }
+        value = clamp(value, 0.0, 1.0);
         return value * value * (3.0 - 2.0 * value);
     }
 
