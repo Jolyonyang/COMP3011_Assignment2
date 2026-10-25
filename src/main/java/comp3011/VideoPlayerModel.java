@@ -66,8 +66,11 @@ public class VideoPlayerModel {
     // Concurrency parameters tuned for 8-core benchmark platforms (e.g. TITAN VM c7i.2xlarge)
     // Reserve at least 1 core for JavaFX UI thread, Prism Direct3D render thread, and TITAN screen capture
     private static final int WORKER_COUNT = Math.max(3, Runtime.getRuntime().availableProcessors() - 1);
-    private static final int MAX_BUFFERED_FRAMES = 36;
-    private static final int PREROLL_FRAME_COUNT = 10;
+    private static final int MAX_BUFFERED_FRAMES = 48;
+    private static final int PREROLL_FRAME_COUNT = 24;
+    // Upper bound on frames being decoded/filtered at once. The pool is the backpressure:
+    // the decoder blocks when every pooled buffer is in flight instead of allocating more.
+    private static final int FRAME_POOL_SIZE = WORKER_COUNT * 2 + 2;
 
     private final List<FrameProcessor> frameProcessors;
     private final Queue<PendingAudio> pendingAudio = new ConcurrentLinkedQueue<>();
@@ -84,10 +87,12 @@ public class VideoPlayerModel {
     private ExecutorService workerPool;
     private Thread decoderThread;
     private final PriorityBlockingQueue<PreparedFrame> readyFrames = new PriorityBlockingQueue<>();
-    private final BlockingQueue<Frame> framePool = new ArrayBlockingQueue<>(MAX_BUFFERED_FRAMES + 4);
+    private final BlockingQueue<Frame> framePool = new ArrayBlockingQueue<>(FRAME_POOL_SIZE);
     private final AtomicLong currentSeekEpoch = new AtomicLong(0);
     private final AtomicBoolean playbackActive = new AtomicBoolean(false);
     private final AtomicBoolean decoderEof = new AtomicBoolean(false);
+    private final AtomicInteger framesInFlight = new AtomicInteger(0);
+    private volatile int lastDisplayedFrameNumber = Integer.MIN_VALUE;
 
     private final AnimationTimer playbackTimer = new AnimationTimer() {
         @Override
@@ -317,16 +322,21 @@ public class VideoPlayerModel {
         int stride = width * channels;
         int bufferBytes = stride * height;
 
-        int poolSize = Math.max(16, WORKER_COUNT * 3);
-        for (int i = 0; i < poolSize; i++) {
-            Frame pooled = new Frame(width, height, Frame.DEPTH_UBYTE, channels);
+        for (int i = 0; i < FRAME_POOL_SIZE; i++) {
+            // No-arg Frame avoids a wasted native allocation; buffers are reused for the whole session.
+            Frame pooled = new Frame();
+            pooled.imageWidth = width;
+            pooled.imageHeight = height;
+            pooled.imageDepth = Frame.DEPTH_UBYTE;
+            pooled.imageChannels = channels;
             pooled.imageStride = stride;
-            ByteBuffer directBuffer = ByteBuffer.allocateDirect(bufferBytes);
-            pooled.image = new Buffer[]{directBuffer};
+            pooled.image = new Buffer[]{ByteBuffer.allocateDirect(bufferBytes)};
             framePool.offer(pooled);
         }
 
         readyFrames.clear();
+        framesInFlight.set(0);
+        lastDisplayedFrameNumber = Integer.MIN_VALUE;
         decoderEof.set(false);
     }
 
@@ -412,22 +422,46 @@ public class VideoPlayerModel {
                 continue;
             }
 
-            Frame pooledFrame = framePool.poll();
-            if (pooledFrame == null) {
-                pooledFrame = copyFrameData(frame);
-            } else {
-                populatePooledFrame(pooledFrame, frame);
+            // Backpressure: wait for a free pooled buffer rather than allocating a new one.
+            // The grabber is not touched while waiting, so 'frame' stays valid.
+            Frame pooledFrame = null;
+            while (pooledFrame == null && playbackOpen && playbackActive.get()
+                    && currentSeekEpoch.get() == currentEpoch) {
+                try {
+                    pooledFrame = framePool.poll(10, TimeUnit.MILLISECONDS);
+                } catch (InterruptedException e) {
+                    break;
+                }
             }
+            if (pooledFrame == null) {
+                continue;
+            }
+            populatePooledFrame(pooledFrame, frame);
 
             int frameNumber = grabber.getFrameNumber();
             long taskEpoch = currentEpoch;
             Frame taskFrame = pooledFrame;
 
-            workerPool.submit(() -> processAndConvertFrame(taskFrame, frameNumber, timestampUs, taskEpoch));
+            framesInFlight.incrementAndGet();
+            try {
+                workerPool.submit(() -> processAndConvertFrame(taskFrame, frameNumber, timestampUs, taskEpoch));
+            } catch (Exception e) {
+                framesInFlight.decrementAndGet();
+                recycleFrame(taskFrame);
+                break;
+            }
         }
     }
 
     private void processAndConvertFrame(Frame frame, int frameNumber, long timestampUs, long taskEpoch) {
+        try {
+            processAndConvertFrameInner(frame, frameNumber, timestampUs, taskEpoch);
+        } finally {
+            framesInFlight.decrementAndGet();
+        }
+    }
+
+    private void processAndConvertFrameInner(Frame frame, int frameNumber, long timestampUs, long taskEpoch) {
         try {
             if (currentSeekEpoch.get() != taskEpoch || !playbackOpen) {
                 recycleFrame(frame);
@@ -476,29 +510,20 @@ public class VideoPlayerModel {
         destination.timestamp = source.timestamp;
 
         if (source.image != null && source.image.length > 0 && source.image[0] instanceof ByteBuffer srcBb) {
-            if (destination.image[0] instanceof ByteBuffer dstBb) {
-                dstBb.clear();
-                ByteBuffer duplicate = srcBb.duplicate();
-                duplicate.clear();
-                int bytesToCopy = Math.min(dstBb.capacity(), duplicate.capacity());
-                duplicate.limit(bytesToCopy);
-                dstBb.put(duplicate);
-                dstBb.clear();
-            }
-        }
-    }
-
-    private Frame copyFrameData(Frame source) {
-        Frame copy = source.clone();
-        if (source.image != null && source.image.length > 0 && source.image[0] instanceof ByteBuffer srcBb) {
-            ByteBuffer directBuffer = ByteBuffer.allocateDirect(srcBb.capacity());
             ByteBuffer duplicate = srcBb.duplicate();
             duplicate.clear();
-            directBuffer.put(duplicate);
-            directBuffer.clear();
-            copy.image = new Buffer[]{directBuffer};
+            int bytesNeeded = duplicate.capacity();
+
+            // Grow once if the decoder's stride/padding exceeds our initial estimate.
+            if (!(destination.image[0] instanceof ByteBuffer existing) || existing.capacity() < bytesNeeded) {
+                destination.image[0] = ByteBuffer.allocateDirect(bytesNeeded);
+            }
+
+            ByteBuffer dstBb = (ByteBuffer) destination.image[0];
+            dstBb.clear();
+            dstBb.put(duplicate);
+            dstBb.clear();
         }
-        return copy;
     }
 
     private void pumpPlayback(long now) {
@@ -536,17 +561,30 @@ public class VideoPlayerModel {
             playbackStartNs = now;
         }
 
-        if (readyFrames.isEmpty() && decoderEof.get()) {
+        if (readyFrames.isEmpty() && decoderEof.get() && framesInFlight.get() == 0) {
             finishPlayback();
             return;
         }
 
+        // Drop anything older than what is already on screen (late worker result).
         PreparedFrame frame = readyFrames.peek();
+        while (frame != null && frame.frameNumber() <= lastDisplayedFrameNumber) {
+            readyFrames.poll();
+            frame = readyFrames.peek();
+        }
         if (frame != null) {
             long relativeTimestampUs = Math.max(0, frame.timestampUs() - firstTimestampUs);
             long targetTimeNs = playbackStartNs + relativeTimestampUs * 1_000L;
 
             if (targetTimeNs <= now) {
+                boolean gapBeforeHead = lastDisplayedFrameNumber != Integer.MIN_VALUE
+                        && frame.frameNumber() > lastDisplayedFrameNumber + 1
+                        && framesInFlight.get() > 0;
+                long graceNs = videoFrameDurationUs * 1_000L;
+                if (gapBeforeHead && now - targetTimeNs < graceNs) {
+                    // The missing frame is still in a worker; give it one frame period.
+                    return;
+                }
                 readyFrames.poll();
                 displayPreparedFrame(frame, targetTimeNs, now);
             }
@@ -554,6 +592,7 @@ public class VideoPlayerModel {
     }
 
     private void displayPreparedFrame(PreparedFrame frame, long targetTimeNs, long now) {
+        lastDisplayedFrameNumber = frame.frameNumber();
         long relativeTimestampUs = Math.max(0, frame.timestampUs() - firstTimestampUs);
         currentTimestampUs = logicalPlaybackBaseUs + relativeTimestampUs;
         relativeSeekBaseUs = NO_SEEK_REQUEST;
@@ -624,6 +663,7 @@ public class VideoPlayerModel {
         readyFrames.clear();
         pendingAudio.clear();
         decoderEof.set(false);
+        lastDisplayedFrameNumber = Integer.MIN_VALUE;
     }
 
     private void resetPlaybackClock(long logicalTimestampUs) {

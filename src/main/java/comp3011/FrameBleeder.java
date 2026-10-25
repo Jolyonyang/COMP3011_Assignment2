@@ -58,6 +58,8 @@ public class FrameBleeder extends FrameProcessor {
     private double[] xMaskBlend;
     private int[] yMaskTop;
     private double[] yMaskBlend;
+    // Read-only after initialise(): luminance (0..255) -> thresholded brightness.
+    private final double[] brightnessLookup = new double[256];
 
     public FrameBleeder() {
         super();
@@ -70,6 +72,9 @@ public class FrameBleeder extends FrameProcessor {
         maskWidth = (videoInfo.imageWidth() + MASK_BLOCK_SIZE - 1) / MASK_BLOCK_SIZE;
         maskHeight = (videoInfo.imageHeight() + MASK_BLOCK_SIZE - 1) / MASK_BLOCK_SIZE;
         buildSamplingLookups();
+        for (int luminance = 0; luminance < brightnessLookup.length; luminance++) {
+            brightnessLookup[luminance] = thresholdedBrightness(luminance);
+        }
     }
 
     @Override
@@ -164,7 +169,7 @@ public class FrameBleeder extends FrameProcessor {
                     }
                 }
 
-                brightMask[maskY * maskWidth + maskX] = thresholdedBrightness(maximumLuminance);
+                brightMask[maskY * maskWidth + maskX] = brightnessLookup[maximumLuminance];
             }
         }
     }
@@ -226,8 +231,18 @@ public class FrameBleeder extends FrameProcessor {
 
         for (int y = 0; y < height; y++) {
             int rowStart = y * stride;
+            int row0 = yMaskTop[y] * maskWidth;
+            int row1 = Math.min(yMaskTop[y] + 1, maskHeight - 1) * maskWidth;
 
             for (int x = 0; x < width; x++) {
+                int x0 = xMaskLeft[x];
+                int x1 = Math.min(x0 + 1, maskWidth - 1);
+                // All four bilinear corners zero => strength is exactly 0.0; skip the FP work.
+                if (blurredMask[row0 + x0] == 0.0 && blurredMask[row0 + x1] == 0.0
+                        && blurredMask[row1 + x0] == 0.0 && blurredMask[row1 + x1] == 0.0) {
+                    continue;
+                }
+
                 double bleedStrength = sampleBlurredMask(x, y, blurredMask);
                 if (bleedStrength <= 0.0) {
                     continue;
