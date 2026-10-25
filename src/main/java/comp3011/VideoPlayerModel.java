@@ -68,13 +68,13 @@ public class VideoPlayerModel {
     private static final long AUDIO_LEAD_NS = 30_000_000L;
 
     // Concurrency parameters tuned for 8-core benchmark platforms (e.g. TITAN VM c7i.2xlarge)
-    // Reserve at least 1 core for JavaFX UI thread, Prism Direct3D render thread, and TITAN screen capture
-    private static final int WORKER_COUNT = Math.max(3, Runtime.getRuntime().availableProcessors() - 1);
+    // Reserve at least 2 cores for JavaFX UI thread, Prism Direct3D render thread, FFmpeg decode, and TITAN screen capture
+    private static final int WORKER_COUNT = Math.max(2, Runtime.getRuntime().availableProcessors() - 2);
     private static final int MAX_BUFFERED_FRAMES = 48;
     private static final int PREROLL_FRAME_COUNT = 24;
     // Upper bound on frames being decoded/filtered at once. The pool is the backpressure:
     // the decoder blocks when every pooled buffer is in flight instead of allocating more.
-    private static final int FRAME_POOL_SIZE = WORKER_COUNT * 2 + 2;
+    private static final int FRAME_POOL_SIZE = Math.max(20, WORKER_COUNT * 3);
 
     private final List<FrameProcessor> frameProcessors;
     private final Queue<PendingAudio> pendingAudio = new ConcurrentLinkedQueue<>();
@@ -617,9 +617,9 @@ public class VideoPlayerModel {
                 boolean gapBeforeHead = lastDisplayedFrameNumber != Integer.MIN_VALUE
                         && frame.frameNumber() > lastDisplayedFrameNumber + 1
                         && framesInFlight.get() > 0;
-                long graceNs = videoFrameDurationUs * 1_000L;
+                long graceNs = videoFrameDurationUs * 2_000L;
                 if (gapBeforeHead && now - targetTimeNs < graceNs) {
-                    // The missing frame is still in a worker; give it one frame period.
+                    // The missing frame is still in a worker; give it up to two frame periods to arrive.
                     return;
                 }
                 readyFrames.poll();

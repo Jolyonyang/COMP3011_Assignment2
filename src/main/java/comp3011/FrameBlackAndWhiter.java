@@ -57,19 +57,16 @@ public class FrameBlackAndWhiter extends FrameProcessor {
         int stride = videoInfo.imageStride();
 
         byte[] data = backingArray(pixels);
-        if (data != null) {
-            for (int y = 0; y < height; y++) {
-                int rowStart = y * stride;
-                for (int x = 0; x < width; x++) {
-                    int base = rowStart + x * channels;
-                    int b = data[base] & 0xff;
-                    int g = data[base + 1] & 0xff;
-                    int r = data[base + 2] & 0xff;
-                    byte luminance = (byte) ((54 * r + 183 * g + 19 * b) / 256);
-                    for (int channel = 0; channel < channels; channel++) {
-                        data[base + channel] = luminance;
-                    }
-                }
+        if (data != null && channels == 3 && stride == width * 3) {
+            int total = width * height * 3;
+            for (int i = 0; i < total; i += 3) {
+                int b = data[i] & 0xff;
+                int g = data[i + 1] & 0xff;
+                int r = data[i + 2] & 0xff;
+                byte lum = (byte) ((54 * r + 183 * g + 19 * b) >> 8);
+                data[i] = lum;
+                data[i + 1] = lum;
+                data[i + 2] = lum;
             }
             return;
         }

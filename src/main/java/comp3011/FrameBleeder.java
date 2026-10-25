@@ -158,15 +158,20 @@ public class FrameBleeder extends FrameProcessor {
                 int maximumLuminance = 0;
 
                 if (data != null) {
+                    blockLoop:
                     for (int y = blockY; y < blockYEnd; y++) {
-                        int rowStart = y * stride;
-                        for (int x = blockX; x < blockXEnd; x++) {
-                            int base = rowStart + x * channels;
+                        int base = y * stride + blockX * channels;
+                        for (int x = blockX; x < blockXEnd; x++, base += channels) {
                             int b = data[base] & 0xff;
                             int g = data[base + 1] & 0xff;
                             int r = data[base + 2] & 0xff;
-                            int luminance = (54 * r + 183 * g + 19 * b) / 256;
-                            maximumLuminance = Math.max(maximumLuminance, luminance);
+                            int luminance = (54 * r + 183 * g + 19 * b) >> 8;
+                            if (luminance > maximumLuminance) {
+                                maximumLuminance = luminance;
+                                if (maximumLuminance >= 255) {
+                                    break blockLoop;
+                                }
+                            }
                         }
                     }
                     brightMask[maskY * maskWidth + maskX] = brightnessLookup[maximumLuminance];
@@ -246,6 +251,47 @@ public class FrameBleeder extends FrameProcessor {
         int channels = videoInfo.imageChannels();
         int stride = videoInfo.imageStride();
         byte[] data = backingArray(pixels);
+
+        if (data != null && channels == 3 && stride == width * 3) {
+            int base = 0;
+            for (int y = 0; y < height; y++) {
+                int y0 = yMaskTop[y];
+                int y1 = Math.min(y0 + 1, maskHeight - 1);
+                int row0 = y0 * maskWidth;
+                int row1 = y1 * maskWidth;
+                double yBlend = yMaskBlend[y];
+
+                for (int x = 0; x < width; x++, base += 3) {
+                    int x0 = xMaskLeft[x];
+                    int x1 = Math.min(x0 + 1, maskWidth - 1);
+                    double m00 = blurredMask[row0 + x0];
+                    double m01 = blurredMask[row0 + x1];
+                    double m10 = blurredMask[row1 + x0];
+                    double m11 = blurredMask[row1 + x1];
+                    if (m00 == 0.0 && m01 == 0.0 && m10 == 0.0 && m11 == 0.0) {
+                        continue;
+                    }
+
+                    double xBlend = xMaskBlend[x];
+                    double top = m00 + (m01 - m00) * xBlend;
+                    double bottom = m10 + (m11 - m10) * xBlend;
+                    double val = top + (bottom - top) * yBlend;
+                    double bleedStrength = Math.min(1.0, val * BLEED_MASK_GAIN);
+                    if (bleedStrength <= 0.0) {
+                        continue;
+                    }
+
+                    int blueBoost = (int) Math.round(bleedStrength * BLUE_BLEED_STRENGTH);
+                    int greenBoost = (int) Math.round(bleedStrength * GREEN_BLEED_STRENGTH);
+                    int redBoost = (int) Math.round(bleedStrength * RED_BLEED_STRENGTH);
+
+                    data[base] = (byte) Math.min(255, (data[base] & 0xff) + blueBoost);
+                    data[base + 1] = (byte) Math.min(255, (data[base + 1] & 0xff) + greenBoost);
+                    data[base + 2] = (byte) Math.min(255, (data[base + 2] & 0xff) + redBoost);
+                }
+            }
+            return;
+        }
 
         for (int y = 0; y < height; y++) {
             int rowStart = y * stride;

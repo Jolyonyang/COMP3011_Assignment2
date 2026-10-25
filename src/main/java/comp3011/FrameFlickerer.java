@@ -80,6 +80,13 @@ public class FrameFlickerer extends FrameProcessor {
         int stride = videoInfo.imageStride();
 
         byte[] data = backingArray(pixels);
+        if (data != null && stride == widthBytes) {
+            int total = height * stride;
+            for (int i = 0; i < total; i++) {
+                data[i] = dimLookup[data[i] & 0xff];
+            }
+            return;
+        }
         if (data != null) {
             for (int y = 0; y < height; y++) {
                 int rowStart = y * stride;

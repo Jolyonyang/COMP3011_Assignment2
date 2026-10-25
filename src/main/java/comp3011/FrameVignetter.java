@@ -125,18 +125,16 @@ public class FrameVignetter extends FrameProcessor {
         int stride = videoInfo.imageStride();
 
         byte[] data = backingArray(pixels);
-        if (data != null) {
+        if (data != null && channels == 3 && stride == width * 3) {
             byte[][] xTables = xLookups;
+            int idx = 0;
             for (int y = 0; y < height; y++) {
-                int rowStart = y * stride;
                 byte[] yLookup = yLookups[y];
-                for (int x = 0; x < width; x++) {
-                    int base = rowStart + x * channels;
+                for (int x = 0; x < width; x++, idx += 3) {
                     byte[] xLookup = xTables[x];
-                    for (int channel = 0; channel < channels; channel++) {
-                        int index = base + channel;
-                        data[index] = yLookup[xLookup[data[index] & 0xff] & 0xff];
-                    }
+                    data[idx] = yLookup[xLookup[data[idx] & 0xff] & 0xff];
+                    data[idx + 1] = yLookup[xLookup[data[idx + 1] & 0xff] & 0xff];
+                    data[idx + 2] = yLookup[xLookup[data[idx + 2] & 0xff] & 0xff];
                 }
             }
             return;
