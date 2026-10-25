@@ -4,7 +4,7 @@
  * 
  * Authors:
  *   1. Simon Ratcliffe, in collaboration with GPT-5.6 Terra
- *   2. COMP3011 Student (Assignment 2 Multi-Threaded Concurrency Test Suite)
+ *   2. JiaoYang Yang (a3126438)
  *
  * Attribution / Acknowledgments:
  *   - Concurrency unit test verifying thread-safety and pixel-identical determinism
