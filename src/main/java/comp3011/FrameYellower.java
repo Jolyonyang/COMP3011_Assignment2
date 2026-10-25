@@ -119,6 +119,23 @@ public class FrameYellower extends FrameProcessor {
         int channels = videoInfo.imageChannels();
         int stride = videoInfo.imageStride();
 
+        byte[] data = backingArray(pixels);
+        if (data != null) {
+            byte[] bLut = blueLookup;
+            byte[] gLut = greenLookup;
+            byte[] rLut = redLookup;
+            for (int y = 0; y < height; y++) {
+                int rowStart = y * stride;
+                for (int x = 0; x < width; x++) {
+                    int base = rowStart + x * channels;
+                    data[base] = bLut[data[base] & 0xff];
+                    data[base + 1] = gLut[data[base + 1] & 0xff];
+                    data[base + 2] = rLut[data[base + 2] & 0xff];
+                }
+            }
+            return;
+        }
+
         for (int y = 0; y < height; y++) {
             int rowStart = y * stride;
             for (int x = 0; x < width; x++) {

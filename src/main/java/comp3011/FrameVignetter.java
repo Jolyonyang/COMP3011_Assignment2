@@ -69,6 +69,7 @@ public class FrameVignetter extends FrameProcessor {
     private byte[][] buildAxisLookups(int size) {
         byte[][] lookups = new byte[size][256];
         double[] envelope = buildGaussianEnvelope(size);
+        java.util.Map<ByteBuffer, byte[]> canonical = new java.util.HashMap<>();
 
         for (int position = 0; position < size; position++) {
             for (int value = 0; value < 256; value++) {
@@ -77,6 +78,8 @@ public class FrameVignetter extends FrameProcessor {
                         0,
                         255);
             }
+            // Many positions round to an identical table; share one instance to cut cache footprint.
+            lookups[position] = canonical.computeIfAbsent(ByteBuffer.wrap(lookups[position]), key -> key.array());
         }
 
         return lookups;
@@ -120,6 +123,24 @@ public class FrameVignetter extends FrameProcessor {
         int width = videoInfo.imageWidth();
         int channels = videoInfo.imageChannels();
         int stride = videoInfo.imageStride();
+
+        byte[] data = backingArray(pixels);
+        if (data != null) {
+            byte[][] xTables = xLookups;
+            for (int y = 0; y < height; y++) {
+                int rowStart = y * stride;
+                byte[] yLookup = yLookups[y];
+                for (int x = 0; x < width; x++) {
+                    int base = rowStart + x * channels;
+                    byte[] xLookup = xTables[x];
+                    for (int channel = 0; channel < channels; channel++) {
+                        int index = base + channel;
+                        data[index] = yLookup[xLookup[data[index] & 0xff] & 0xff];
+                    }
+                }
+            }
+            return;
+        }
 
         for (int y = 0; y < height; y++) {
             int rowStart = y * stride;

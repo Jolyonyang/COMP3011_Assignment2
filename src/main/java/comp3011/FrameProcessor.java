@@ -4,12 +4,17 @@
  * 
  * Authors:
  *   1. Simon Ratcliffe, in collaboration with GPT-5.6 Terra
- *   2. <student name and student number insert here upon modification>
+ *   2. JiaoYang Yang (a3126438)
+ *
+ * Attribution / Acknowledgments:
+ *   - Added backingArray() so effects can take a zero-copy byte[] fast path on
+ *     heap-backed frames supplied by the multi-threaded pipeline.
  *
  * Copyright 2026 Simon Ratcliffe
  */
 package comp3011;
 
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.zip.CRC32;
 
@@ -52,6 +57,13 @@ public abstract class FrameProcessor {
         byte[] bytes = mediaName.getBytes(StandardCharsets.UTF_8);
         crc.update(bytes, 0, bytes.length);
         return (int) crc.getValue();
+    }
+
+    // Returns the frame's backing byte[] when the pixels are heap-backed with no offset, otherwise null.
+    // Effects use this for a plain-array fast path (identical results, no per-byte ByteBuffer calls)
+    // and fall back to ByteBuffer access for direct buffers.
+    protected static byte[] backingArray(ByteBuffer pixels) {
+        return pixels.hasArray() && pixels.arrayOffset() == 0 ? pixels.array() : null;
     }
 
     public abstract void process(Frame frame, InfoFrame info) throws Exception;

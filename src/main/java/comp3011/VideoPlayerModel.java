@@ -22,6 +22,7 @@ package comp3011;
 import java.io.File;
 import java.nio.Buffer;
 import java.nio.ByteBuffer;
+import java.nio.IntBuffer;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Queue;
@@ -48,6 +49,9 @@ import org.bytedeco.javacv.JavaFXFrameConverter;
 import javafx.animation.AnimationTimer;
 import javafx.application.Platform;
 import javafx.scene.image.Image;
+import javafx.scene.image.PixelBuffer;
+import javafx.scene.image.PixelFormat;
+import javafx.scene.image.WritableImage;
 
 /**
  * The multi-threaded model part of the video player model-view-controller architecture.
@@ -330,7 +334,8 @@ public class VideoPlayerModel {
             pooled.imageDepth = Frame.DEPTH_UBYTE;
             pooled.imageChannels = channels;
             pooled.imageStride = stride;
-            pooled.image = new Buffer[]{ByteBuffer.allocateDirect(bufferBytes)};
+            // Heap-backed so frame processors can use their byte[] fast path (see FrameProcessor.backingArray).
+            pooled.image = new Buffer[]{ByteBuffer.wrap(new byte[bufferBytes])};
             framePool.offer(pooled);
         }
 
@@ -461,6 +466,39 @@ public class VideoPlayerModel {
         }
     }
 
+    /**
+     * Converts a processed BGR frame into a displayable image on the worker thread.
+     * Packs opaque ARGB ints in one pass and hands them to JavaFX via a PixelBuffer
+     * (no further copy/format conversion). Displayed colours are identical to
+     * JavaFXFrameConverter, which is still used for any non-BGR or non-heap frame.
+     */
+    private Image toFxImage(Frame frame) {
+        int width = frame.imageWidth;
+        int height = frame.imageHeight;
+        int stride = frame.imageStride;
+        if (frame.imageChannels != 3 || !(frame.image[0] instanceof ByteBuffer pixels) || !pixels.hasArray()) {
+            return threadLocalConverter.get().convert(frame);
+        }
+
+        byte[] data = pixels.array();
+        int offset = pixels.arrayOffset();
+        int[] argb = new int[width * height];
+        for (int y = 0; y < height; y++) {
+            int source = offset + y * stride;
+            int target = y * width;
+            for (int x = 0; x < width; x++, source += 3) {
+                argb[target + x] = 0xFF000000
+                        | (data[source + 2] & 0xff) << 16
+                        | (data[source + 1] & 0xff) << 8
+                        | (data[source] & 0xff);
+            }
+        }
+
+        PixelBuffer<IntBuffer> buffer = new PixelBuffer<>(
+                width, height, IntBuffer.wrap(argb), PixelFormat.getIntArgbPreInstance());
+        return new WritableImage(buffer);
+    }
+
     private void processAndConvertFrameInner(Frame frame, int frameNumber, long timestampUs, long taskEpoch) {
         try {
             if (currentSeekEpoch.get() != taskEpoch || !playbackOpen) {
@@ -471,8 +509,7 @@ public class VideoPlayerModel {
             InfoFrame info = new InfoFrame(frameNumber, timestampUs);
             processFrame(frame, info);
 
-            JavaFXFrameConverter converter = threadLocalConverter.get();
-            Image image = converter.convert(frame);
+            Image image = toFxImage(frame);
 
             recycleFrame(frame);
 
@@ -516,7 +553,7 @@ public class VideoPlayerModel {
 
             // Grow once if the decoder's stride/padding exceeds our initial estimate.
             if (!(destination.image[0] instanceof ByteBuffer existing) || existing.capacity() < bytesNeeded) {
-                destination.image[0] = ByteBuffer.allocateDirect(bytesNeeded);
+                destination.image[0] = ByteBuffer.wrap(new byte[bytesNeeded]);
             }
 
             ByteBuffer dstBb = (ByteBuffer) destination.image[0];

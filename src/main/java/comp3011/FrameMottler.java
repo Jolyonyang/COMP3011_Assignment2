@@ -256,6 +256,7 @@ public class FrameMottler extends FrameProcessor {
         int stride = videoInfo.imageStride();
 
         int[] scaleIndices = new int[3];
+        byte[] data = backingArray(pixels);
 
         for (int blockY = 0; blockY < height; blockY += EFFECT_BLOCK_SIZE) {
             int blockYEnd = Math.min(blockY + EFFECT_BLOCK_SIZE, height);
@@ -273,6 +274,21 @@ public class FrameMottler extends FrameProcessor {
                         cache,
                         damageMaskBlend,
                         scaleIndices)) {
+                    continue;
+                }
+
+                if (data != null) {
+                    applyMottleBlock(
+                            data,
+                            blockX,
+                            blockXEnd,
+                            blockY,
+                            blockYEnd,
+                            channels,
+                            stride,
+                            scaleIndices[0],
+                            scaleIndices[1],
+                            scaleIndices[2]);
                     continue;
                 }
 
@@ -351,6 +367,32 @@ public class FrameMottler extends FrameProcessor {
         outIndices[0] = scaleIndex(blueScale);
         outIndices[1] = scaleIndex(greenScale);
         outIndices[2] = scaleIndex(redScale);
+    }
+
+    private void applyMottleBlock(
+            byte[] data,
+            int blockX,
+            int blockXEnd,
+            int blockY,
+            int blockYEnd,
+            int channels,
+            int stride,
+            int blueIndex,
+            int greenIndex,
+            int redIndex) {
+        byte[] blueLookup = scaleLookups[blueIndex];
+        byte[] greenLookup = scaleLookups[greenIndex];
+        byte[] redLookup = scaleLookups[redIndex];
+
+        for (int y = blockY; y < blockYEnd; y++) {
+            int rowStart = y * stride;
+            for (int x = blockX; x < blockXEnd; x++) {
+                int base = rowStart + x * channels;
+                data[base] = blueLookup[data[base] & 0xff];
+                data[base + 1] = greenLookup[data[base + 1] & 0xff];
+                data[base + 2] = redLookup[data[base + 2] & 0xff];
+            }
+        }
     }
 
     private void applyMottleBlock(

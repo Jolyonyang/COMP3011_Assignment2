@@ -146,6 +146,7 @@ public class FrameBleeder extends FrameProcessor {
         int height = videoInfo.imageHeight();
         int channels = videoInfo.imageChannels();
         int stride = videoInfo.imageStride();
+        byte[] data = backingArray(pixels);
 
         for (int maskY = 0; maskY < maskHeight; maskY++) {
             int blockY = maskY * MASK_BLOCK_SIZE;
@@ -155,6 +156,22 @@ public class FrameBleeder extends FrameProcessor {
                 int blockX = maskX * MASK_BLOCK_SIZE;
                 int blockXEnd = Math.min(blockX + MASK_BLOCK_SIZE, width);
                 int maximumLuminance = 0;
+
+                if (data != null) {
+                    for (int y = blockY; y < blockYEnd; y++) {
+                        int rowStart = y * stride;
+                        for (int x = blockX; x < blockXEnd; x++) {
+                            int base = rowStart + x * channels;
+                            int b = data[base] & 0xff;
+                            int g = data[base + 1] & 0xff;
+                            int r = data[base + 2] & 0xff;
+                            int luminance = (54 * r + 183 * g + 19 * b) / 256;
+                            maximumLuminance = Math.max(maximumLuminance, luminance);
+                        }
+                    }
+                    brightMask[maskY * maskWidth + maskX] = brightnessLookup[maximumLuminance];
+                    continue;
+                }
 
                 for (int y = blockY; y < blockYEnd; y++) {
                     int rowStart = y * stride;
@@ -228,6 +245,7 @@ public class FrameBleeder extends FrameProcessor {
         int height = videoInfo.imageHeight();
         int channels = videoInfo.imageChannels();
         int stride = videoInfo.imageStride();
+        byte[] data = backingArray(pixels);
 
         for (int y = 0; y < height; y++) {
             int rowStart = y * stride;
@@ -252,6 +270,13 @@ public class FrameBleeder extends FrameProcessor {
                 int greenBoost = (int) Math.round(bleedStrength * GREEN_BLEED_STRENGTH);
                 int redBoost = (int) Math.round(bleedStrength * RED_BLEED_STRENGTH);
                 int base = rowStart + x * channels;
+
+                if (data != null) {
+                    data[base] = (byte) Math.min(255, (data[base] & 0xff) + blueBoost);
+                    data[base + 1] = (byte) Math.min(255, (data[base + 1] & 0xff) + greenBoost);
+                    data[base + 2] = (byte) Math.min(255, (data[base + 2] & 0xff) + redBoost);
+                    continue;
+                }
 
                 pixels.put(base, boostedByte(pixels.get(base), blueBoost));
                 pixels.put(base + 1, boostedByte(pixels.get(base + 1), greenBoost));
